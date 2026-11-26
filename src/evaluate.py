@@ -86,31 +86,40 @@ def plot_confusions(cms: dict, path=None):
     return fig
 
 
-def attack_size_table(data: dict, out: dict, bins=(0, 0.25, 0.5, 1, 2, 4, np.inf)) -> pd.DataFrame:
-    """Feeder-level alarm rates on consistent-attack event steps, by size of the faked change."""
+def _feeder_flags(out: dict, flags: dict | None) -> dict:
+    return flags or {"chi2": out["wls"].flag, "balance": out["bal_flag"]}
+
+
+def attack_size_table(data: dict, out: dict, bins=(0, 0.25, 0.5, 1, 2, 4, np.inf),
+                      flags: dict | None = None, subtypes=("consistent",)) -> pd.DataFrame:
+    """Feeder-level alarm rates on attack event steps, by size of the faked change.
+
+    `flags` maps a column name to a boolean Series over (episode, step); by default the
+    chi-square alarm and the energy-balance alarm.
+    """
     E, R, T, D = data["episodes"], data["readings"], data["true"], data["defs"]
+    flags = _feeder_flags(out, flags)
     rows = []
-    for ep, e in E[(E.cls == "attack") & (E.subtype == "consistent")].iterrows():
+    for ep, e in E[(E.cls == "attack") & E.subtype.isin(subtypes)].iterrows():
         p = D.index[(D.meter == e.target_meter) & (D.meas_type == "p")][0]
-        steps = range(e.event_start, len(R.loc[ep]))
-        for s in steps:
-            rows.append({"dP_kW": abs(R.at[(ep, s), p] - T.at[(ep, s), p]) * 1e3,
-                         "chi2": bool(out["wls"].at[(ep, s), "flag"]),
-                         "balance": bool(out["bal_flag"].at[(ep, s)])})
+        for s in range(e.event_start, len(R.loc[ep])):
+            row = {"dP_kW": abs(R.at[(ep, s), p] - T.at[(ep, s), p]) * 1e3}
+            row.update({k: bool(f.at[(ep, s)]) for k, f in flags.items()})
+            rows.append(row)
     df = pd.DataFrame(rows)
     df["size"] = pd.cut(df.dP_kW, bins, right=False)
-    tab = df.groupby("size", observed=True).agg(steps=("chi2", "size"), chi2=("chi2", "mean"),
-                                                 balance=("balance", "mean"))
-    return tab
+    agg = {"steps": (list(flags)[0], "size")}
+    agg.update({k: (k, "mean") for k in flags})
+    return df.groupby("size", observed=True).agg(**agg)
 
 
-def reference_rates(data: dict, out: dict) -> pd.Series:
+def reference_rates(data: dict, out: dict, flags: dict | None = None) -> pd.Series:
     """Same alarms on real load-change event steps (should stay near the false-alarm level)."""
     E = data["episodes"]
-    idx = [(ep, s) for ep, e in E[E.cls == "load_change"].iterrows()
+    flags = _feeder_flags(out, flags)
+    idx = [(ep, s) for ep, e in E[(E.cls == "load_change") & (E.subtype.isin(["up", "down"]))].iterrows()
            for s in range(e.event_start, 96)]
-    return pd.Series({"chi2": out["wls"].flag.loc[idx].mean(),
-                      "balance": out["bal_flag"].loc[idx].mean()})
+    return pd.Series({k: f.loc[idx].mean() for k, f in flags.items()})
 
 
 def plot_attack_size(tab: pd.DataFrame, ref: pd.Series, path=None):
@@ -134,7 +143,7 @@ def peer_coverage(data: dict, out: dict) -> pd.DataFrame:
     E, L = data["episodes"], data["labels"]
     cov = out["peer_covered"]
     rows = []
-    for ep, e in E[E.cls.isin(["normal", "comm_loss"])].iterrows():
+    for ep, e in E[E.cls.isin(["normal", "comm_loss"]) & (E.subtype != "cloud")].iterrows():
         t0 = e.event_start if e.event_start >= 0 else 48
         healthy = [m for m in cov.columns if m not in e.affected.split(",")]
         rows.append({"episode": ep, "case": "normal" if e.cls == "normal" else e.subtype,
@@ -167,7 +176,7 @@ def chance_detection(episodes: pd.DataFrame, pred: pd.DataFrame, start: int = 48
     rng = np.random.default_rng(seed)
     meters = [m for m in pred.columns if m != "TRAFO"]
     hits = {c: [] for c in CLASSES if c != "normal"}
-    for ep in episodes.index[episodes.cls == "normal"]:
+    for ep in episodes.index[(episodes.cls == "normal") & (episodes.subtype == "none")]:
         after = pred.loc[ep].loc[start:, rng.choice(meters)]
         for c in hits:
             hits[c].append((after == c).any())

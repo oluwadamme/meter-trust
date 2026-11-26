@@ -122,24 +122,34 @@ Days 21-27 only, at about the same false-alarm level (0.8 % and 1.0 % of normal 
 
 ![Feature importance](figures/feature_importance.png)
 
-## With rooftop solar (work in progress)
+## With rooftop solar
 
-The same study on SimBench's 2034 version of the feeder, in June: 58 customers and 6 rooftop PV systems (172 kWp), so for 13 % of the time power flows backwards through the transformer. Details are in `notebooks/05_rooftop_pv.ipynb`.
+The same study on SimBench's 2034 version of the feeder, in June: 58 customers and 6 rooftop PV systems (172 kWp), so for 13 % of the time power flows backwards through the transformer. Everything else is unchanged. Details are in `notebooks/05_rooftop_pv.ipynb`.
 
 ![Transformer power, winter vs summer with solar](figures/pv_backflow.png)
 
-First findings:
-
 - **State estimation is not bothered by backflow.** The textbook check behaves exactly as in winter.
-- **The energy balance gets weaker at midday.** Meter error grows with the reading, so big solar outputs make the meters noisier exactly when the sun shines. At the same attack size, the balance catches fewer consistent attacks than in winter (for 1-2 kW fakes: 53 % instead of 87 %). The textbook check does not lose ground, because it weighs every reading by its own accuracy.
-- **Part of the drop is not about solar.** Summer demand is lower, so the simulated events are smaller in kW. Results have to be compared by event size.
-- **Neighbours share the sun.** The peer check predicts solar customers well relative to their size, but their absolute error is larger.
+- **The energy balance gets weaker at midday.** Meter error grows with the reading, so big solar outputs make the meters noisier exactly when the sun shines. At the same attack size, the plain balance catches fewer consistent attacks than in winter (for 1-2 kW fakes: 53 % instead of 87 %).
+- **Fix: let the balance check know how noisy the meters are at each moment.** Dividing the mismatch by the noise expected from the meters' own accuracy brings most of the sensitivity back (1-2 kW fakes: 53 % to 71 %) with no extra false alarms. In winter it changes almost nothing.
 
-Next: make the energy balance account for the changing meter noise, and add solar-specific cases (a passing cloud, an inverter trip, an attack hidden inside a cloud).
+  ![Noise-aware energy balance](figures/attack_size_noise_aware.png)
+
+- **But the peer check is now the weak link.** The rule-based detector only asks the transformer after the peer check has flagged a meter, so per-event detection does not improve.
+- **Part of the summer drop is not about solar.** Summer demand is lower, so the simulated events are smaller in kW. Results have to be compared by event size.
+- **Solar-specific cases** (20 episodes each, all in daytime):
+
+  | Case | What the detectors did |
+  |---|---|
+  | Passing cloud (harmless) | The feeder-level tests stay quiet, since a real cloud keeps the transformer total consistent. The peer-based rules raise more per-meter false alarms during the cloud (about 1.5 % of meter-steps against 0.6 % on normal days). |
+  | Inverter trips (a real change) | The peer + balance rule calls it a real load change in 80 % of cases, because the transformer confirms it. |
+  | Attack started during a cloud | The cloud does not hide the attack from the energy balance: the cloud is real on both sides of the balance, so the fake still shows up as a mismatch of its own size. |
+
+  ![Attack hidden in a cloud](figures/cloud_attack_example.png)
 
 ## Honest limits
 
 - It is a simulation on one public feeder, with synthetic customer variation. Real data would be messier.
+- In the solar run, clouds are simple step drops on a whole cable, not moving shadows, and the feeder's home batteries are switched off.
 - Each episode has one event lasting to the end of the day. Real faults overlap, come and go, and last weeks.
 - The rule that separates attacks from faults uses only the direction of the change. Downward attacks look like undercounting meters and are labelled as faults.
 - Slow drift is hard for every detector here.

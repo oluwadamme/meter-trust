@@ -219,6 +219,39 @@ def balance_predictions(data: dict, peer_flag, peer_z, bal_flag) -> pd.DataFrame
     return pred
 
 
+# --- 3b. Noise-aware energy balance (rooftop-solar step) ----------------------------------------
+# Meter error is proportional to the reading, so with rooftop PV the meters are noisiest at
+# midday. The plain balance divides by one fixed std for the whole day. This version divides
+# each step's mismatch by the std expected from the meters' own accuracy at that step (the
+# same per-reading std the operator gives WLS, with wide pseudo-std for readings that did
+# not arrive), plus a fixed term for loss-model error.
+
+def _balance_noise(defs, std):
+    tp = defs.index[(defs.meter == "TRAFO") & (defs.meas_type == "p")][0]
+    cols = list(meter_columns(defs).to_numpy()) + [tp]
+    return np.sqrt((std[cols] ** 2).sum(axis=1)).to_numpy()
+
+
+def fit_balance_noise_aware(hist: pd.DataFrame, defs: pd.DataFrame) -> dict:
+    gap, x = _balance_terms(defs, hist)
+    coef, *_ = np.linalg.lstsq(x, gap, rcond=None)
+    resid = gap - x @ coef
+    meter_sd = _balance_noise(defs, meas.std_devs(defs, hist))
+    extra = np.sqrt(max(resid.var() - np.mean(meter_sd ** 2), 0.0))  # loss-model error
+    e = resid / np.sqrt(meter_sd ** 2 + extra ** 2)
+    return {"coef": coef, "extra": extra, "threshold": _rolling_threshold(pd.Series(e))}
+
+
+def balance_scores_noise_aware(data: dict, model: dict):
+    defs = data["defs"]
+    vals, std = operator_view(defs, data["readings"], data["fresh"])
+    gap, x = _balance_terms(defs, vals)
+    sd = np.sqrt(_balance_noise(defs, std) ** 2 + model["extra"] ** 2)
+    e = pd.Series((gap - x @ model["coef"]) / sd, index=vals.index)
+    ebar = e.groupby(level="episode").transform(lambda s: s.rolling(WINDOW, min_periods=WINDOW).mean())
+    return ebar, ebar.abs() > model["threshold"]
+
+
 # --- run everything ----------------------------------------------------------------------------
 
 def run_all(data: dict, net=None, wls: pd.DataFrame | None = None) -> dict:
@@ -229,9 +262,14 @@ def run_all(data: dict, net=None, wls: pd.DataFrame | None = None) -> dict:
     peer_model, bal_model = fit_peers(hist, defs), fit_balance(hist, defs)
     peer_z, peer_flag, covered = peer_scores(data, peer_model)
     bal_e, bal_flag = balance_scores(data, bal_model)
+    nw_model = fit_balance_noise_aware(hist, defs)
+    nw_e, nw_flag = balance_scores_noise_aware(data, nw_model)
     if wls is None:
         wls = run_wls_baseline(data)
     return {
+        # extra variants, kept out of "pred" so notebooks 03-04 stay as published
+        "pred_extra": {"balance_nw": balance_predictions(data, peer_flag, peer_z, nw_flag)},
+        "bal_nw_e": nw_e, "bal_nw_flag": nw_flag, "bal_nw_model": nw_model,
         "pred": {"wls": wls_predictions(data, wls),
                  "peer": peer_predictions(data, peer_flag),
                  "balance": balance_predictions(data, peer_flag, peer_z, bal_flag)},

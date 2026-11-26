@@ -17,14 +17,20 @@ import train as tr
 
 def run(name: str) -> tuple[dict, dict]:
     grid.use_run(name)
-    if not (grid.DATA_DIR / "scenarios" / "labels.parquet").exists():
-        sc.save(sc.generate())          # also builds the power flow if missing
+    labels_file = grid.DATA_DIR / "scenarios" / "episodes.parquet"
+    want_pv = name == "summer_pv"
+    if not labels_file.exists() or (want_pv and "cloud" not in set(pd.read_parquet(labels_file).subtype)):
+        sc.save(sc.generate(pv_extras=want_pv))   # also builds the power flow if missing
     data = sc.load()
     wls_file = grid.DATA_DIR / "detectors" / "wls.parquet"
-    if wls_file.exists():
-        wls = pd.read_parquet(wls_file)
-    else:
-        wls = det.run_wls_baseline(data)
+    wls = pd.read_parquet(wls_file) if wls_file.exists() else None
+    done = set() if wls is None else set(wls.index.get_level_values("episode"))
+    todo = [e for e in data["episodes"].index if e not in done]
+    if todo:  # WLS only for episodes not yet estimated (standard episodes never change)
+        sub = {k: (v.loc[todo] if k in ("readings", "true", "fresh", "labels", "episodes") else v)
+               for k, v in data.items()}
+        new = det.run_wls_baseline(sub)
+        wls = new if wls is None else pd.concat([wls, new]).sort_index()
         wls_file.parent.mkdir(parents=True, exist_ok=True)
         wls.to_parquet(wls_file)
     out = det.run_all(data, wls=wls)
@@ -38,6 +44,8 @@ def run(name: str) -> tuple[dict, dict]:
 def summary(data: dict, out: dict) -> pd.Series:
     """Headline numbers for one run, for side-by-side comparison."""
     E, L, wls = data["episodes"], data["labels"], out["wls"]
+    E = E[~E.subtype.isin(sc.PV_SUBTYPES)]  # standard episodes only, comparable across runs
+    L = L.loc[E.index]
     normal = wls.loc[E.index[E.cls == "normal"]]
     test = E.index[E.split == "test"]
     s = {
@@ -50,8 +58,8 @@ def summary(data: dict, out: dict) -> pd.Series:
         for cls in ["load_change", "meter_fault", "attack"]:
             s[f"{name}: {cls} events detected"] = d[d.cls == cls].detected.mean()
         s[f"{name}: consistent attacks detected"] = d[d.subtype == "consistent"].detected.mean()
-        s[f"{name}: false alarms"] = ev.false_alarm_rate(L.loc[test] if key == "ml" else L,
-                                                         out["pred"][key].loc[test] if key == "ml" else out["pred"][key])
+        rows = test if key == "ml" else E.index
+        s[f"{name}: false alarms"] = ev.false_alarm_rate(L.loc[rows], out["pred"][key].loc[rows])
     return pd.Series(s)
 
 

@@ -75,20 +75,39 @@ class Episode:
     gateway: str = ""
     factor: float = np.nan   # demand scale / gain / end gain / offset in kW
     affected: list = field(default_factory=list)  # meters labelled with `cls`
+    sgen: int = -1           # PV unit that trips (pv_trip)
+    cloud_steps: int = 0     # length of a passing cloud (cloud, cloud_attack)
+    cloud_factor: float = np.nan  # PV output during the cloud, as a share of normal
 
 
 def _window(profiles: dict, start: int, stop: int) -> dict:
     return {k: df.iloc[start:stop].reset_index(drop=True) for k, df in profiles.items()}
 
 
-def _pf_with_scaled_load(net, defs, profiles, start, stop, load, factor) -> pd.DataFrame:
-    """True measurement values for base steps start..stop-1 with one load scaled."""
+def _pf_with_changes(net, defs, profiles, start, stop, load=None, factor=1.0,
+                     pv_units=(), pv_scale=None) -> pd.DataFrame:
+    """True measurement values for base steps start..stop-1 after physical changes.
+
+    `load` is scaled by `factor` (P and Q) for the whole window; each PV unit in
+    `pv_units` is multiplied by `pv_scale`, an array with one value per step.
+    """
     prof = _window(profiles, start, stop)
-    for col in ("p_mw", "q_mvar"):
-        prof[("load", col)] = prof[("load", col)].copy()
-        prof[("load", col)][load] *= factor
+    if load is not None:
+        for col in ("p_mw", "q_mvar"):
+            prof[("load", col)] = prof[("load", col)].copy()
+            prof[("load", col)][load] *= factor
+    if len(pv_units):
+        pv = prof[("sgen", "p_mw")].copy()
+        for u in pv_units:
+            pv[u] = pv[u].to_numpy() * pv_scale
+        prof[("sgen", "p_mw")] = pv
     res = grid.run_power_flow_series(net, prof)
     return meas.true_values(defs, res)
+
+
+def _pf_with_scaled_load(net, defs, profiles, start, stop, load, factor) -> pd.DataFrame:
+    """True measurement values for base steps start..stop-1 with one load scaled."""
+    return _pf_with_changes(net, defs, profiles, start, stop, load=load, factor=factor)
 
 
 def _demand_factor(rng) -> tuple[str, float]:
@@ -140,13 +159,80 @@ def plan_episodes(net, n_per_class: int = 60, n_steps: int = 96, n_days: int = 2
     return episodes
 
 
+# --- Rooftop-solar cases (summer_pv run only) ----------------------------------------------
+# | subtype      | class       | what happens                                                  |
+# | cloud        | normal      | PV on one cable drops to 20-50 % for 30 min-2 h; power flow   |
+# |              |             | re-run. A real, harmless event: no meter should be flagged.   |
+# | pv_trip      | load_change | one PV inverter trips to zero for the rest of the day. The    |
+# |              |             | readings are true, so for the operator this is a real change. |
+# | cloud_attack | attack      | a consistent attack (as above) that starts at the same moment |
+# |              |             | as a cloud on the target's cable, to hide in the transient.   |
+PV_SUBTYPES = {"cloud": "normal", "pv_trip": "load_change", "cloud_attack": "attack"}
+
+
+def _daytime_start(rng, lo, hi, n_steps, first_hour=9, last_hour=15):
+    """A window start and an event step inside it that falls between first_hour and last_hour."""
+    while True:
+        base = int(rng.integers(lo, hi + 1))
+        steps = [t for t in range(n_steps // 4, 3 * n_steps // 4)
+                 if first_hour <= ((base + t) % grid.STEPS_PER_DAY) / 4 < last_hour]
+        if steps:
+            return base, int(rng.choice(steps))
+
+
+def plan_pv_episodes(net, first_id: int, n_per_subtype: int = 20, n_steps: int = 96,
+                     n_days: int = 28, seed: int = 0) -> list[Episode]:
+    rng = np.random.default_rng(seed + 2)
+    pv_gateways = sorted(set(net.sgen.gateway.dropna()))
+    total = n_days * grid.STEPS_PER_DAY
+    episodes = []
+    for subtype, cls in PV_SUBTYPES.items():
+        for k in range(n_per_subtype):
+            split = "test" if k % 4 == 3 else "train"
+            lo, hi = (0, TRAIN_DAYS * grid.STEPS_PER_DAY - n_steps) if split == "train" \
+                else (TRAIN_DAYS * grid.STEPS_PER_DAY, total - n_steps)
+            base, t0 = _daytime_start(rng, lo, hi, n_steps)
+            ep = Episode(first_id + len(episodes), cls, subtype, split, base_start=base, event_start=t0)
+            if subtype == "pv_trip":
+                ep.sgen = int(rng.choice(net.sgen.index))
+                ep.target_meter = f"C{net.sgen.bus[ep.sgen]}"
+                ep.gateway = str(net.sgen.gateway[ep.sgen])
+                ep.factor = 0.0
+            else:
+                ep.gateway = str(rng.choice(pv_gateways))
+                ep.cloud_steps = int(rng.integers(2, 9))
+                ep.cloud_factor = float(rng.uniform(0.2, 0.5))
+                if subtype == "cloud_attack":
+                    loads = net.load.index[net.load.gateway == ep.gateway]
+                    ep.load = int(rng.choice(loads))
+                    ep.target_meter = f"C{net.load.bus[ep.load]}"
+                    _, ep.factor = _demand_factor(rng)
+            episodes.append(ep)
+    return episodes
+
+
+def _cloud(net, ep, length):
+    """PV units behind the episode's gateway, and their output multiplier per step."""
+    units = list(net.sgen.index[net.sgen.gateway == ep.gateway])
+    scale = np.ones(length)
+    scale[: ep.cloud_steps] = ep.cloud_factor
+    return units, scale
+
+
 def simulate_episode(ep: Episode, net, defs, profiles, true_base, n_steps, rng):
     """Return (true, reported, fresh, labels) frames for one episode, steps 0..n_steps-1."""
     a, b, t0 = ep.base_start, ep.base_start + n_steps, ep.event_start
     true = true_base.iloc[a:b].reset_index(drop=True).copy()
-    if ep.cls == "load_change":
+    if ep.cls == "load_change" and ep.subtype in ("up", "down"):
         true.iloc[t0:] = _pf_with_scaled_load(net, defs, profiles, a + t0, b,
                                               ep.load, ep.factor).to_numpy()
+    elif ep.subtype == "pv_trip":
+        true.iloc[t0:] = _pf_with_changes(net, defs, profiles, a + t0, b, pv_units=[ep.sgen],
+                                          pv_scale=np.zeros(b - a - t0)).to_numpy()
+    elif ep.subtype in ("cloud", "cloud_attack"):
+        units, scale = _cloud(net, ep, b - a - t0)
+        true.iloc[t0:] = _pf_with_changes(net, defs, profiles, a + t0, b, pv_units=units,
+                                          pv_scale=scale).to_numpy()
     reported = meas.add_noise(true, meas.std_devs(defs, true), seed=int(rng.integers(2**31)))
     fresh = pd.DataFrame(True, index=true.index, columns=true.columns)
 
@@ -180,8 +266,13 @@ def simulate_episode(ep: Episode, net, defs, profiles, true_base, n_steps, rng):
         p = defs.index[(defs.meter == ep.target_meter) & (defs.meas_type == "p")]
         reported.loc[t0:, p] += ep.factor / 1e3  # kW -> MW
         ep.affected = [ep.target_meter]
-    elif ep.cls == "attack" and ep.subtype == "consistent":
-        fake = _pf_with_scaled_load(net, defs, profiles, a + t0, b, ep.load, ep.factor)
+    elif ep.cls == "attack" and ep.subtype in ("consistent", "cloud_attack"):
+        if ep.subtype == "cloud_attack":  # the fake operating point includes the real cloud
+            units, scale = _cloud(net, ep, b - a - t0)
+            fake = _pf_with_changes(net, defs, profiles, a + t0, b, load=ep.load, factor=ep.factor,
+                                    pv_units=units, pv_scale=scale)
+        else:
+            fake = _pf_with_scaled_load(net, defs, profiles, a + t0, b, ep.load, ep.factor)
         fake_noisy = meas.add_noise(fake, meas.std_devs(defs, fake), seed=int(rng.integers(2**31)))
         v_gw = defs.index[(defs.meas_type == "v") & (defs.gateway == ep.gateway)]
         hit = cols.union(v_gw)
@@ -195,8 +286,15 @@ def simulate_episode(ep: Episode, net, defs, profiles, true_base, n_steps, rng):
     return true, reported, fresh, labels
 
 
-def generate(net=None, n_per_class: int = 60, n_steps: int = 96, seed: int = 0) -> dict:
-    """Build the whole dataset in memory. ~1-2 min for the default 300 episodes."""
+def generate(net=None, n_per_class: int = 60, n_steps: int = 96, seed: int = 0,
+             pv_extras: bool | None = None) -> dict:
+    """Build the whole dataset in memory. ~1-2 min for the default 300 episodes.
+
+    pv_extras adds 20 episodes each of cloud, pv_trip and cloud_attack after the 300
+    standard ones (default: only for the summer_pv run). The standard episodes come out
+    identical either way.
+    """
+    pv_extras = (grid.RUN == "summer_pv") if pv_extras is None else pv_extras
     net = net if net is not None else grid.load_net()
     defs = meas.define_measurements(net)
     profiles = grid.get_profiles(net, n_days=28)
@@ -208,6 +306,8 @@ def generate(net=None, n_per_class: int = 60, n_steps: int = 96, seed: int = 0) 
     true_base = meas.true_values(defs, base)
 
     episodes = plan_episodes(net, n_per_class, n_steps, seed=seed)
+    if pv_extras:
+        episodes += plan_pv_episodes(net, len(episodes), n_steps=n_steps, seed=seed)
     rng = np.random.default_rng(seed + 1)
     parts = {"true": [], "readings": [], "fresh": [], "labels": []}
     for ep in episodes:

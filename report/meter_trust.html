@@ -79,6 +79,8 @@
 <li><b>Combining the signals helps, modestly.</b> At the same false-alarm level the classifier names 5 of 7 consistent attacks (chance level 7&#8239;%) and every stuck meter. Its load-change score is weaker evidence: it assigns that class so freely that it would hit a random meter in about a quarter of normal episodes. It relies on four signals: whether the reading arrived on time, the peer deviation, whether the reading went flat, and the energy balance. The WLS residuals add almost nothing.</li>
 </ul>
 
+<p><b>With rooftop solar.</b> On SimBench's 2034 version of the same feeder in June (172&#8239;kWp of PV, backflow 13&#8239;% of the time), WLS behaves as in winter, but the energy balance loses sensitivity at midday: meter error grows with the reading, so the meters are noisiest when the sun shines (1&ndash;2&#8239;kW fakes caught 53&#8239;% instead of 87&#8239;%). Scaling the balance by the noise expected at each step restores most of it (71&#8239;%) without extra false alarms. Real clouds do not hide attacks from the balance, since a cloud is consistent on both sides of it.</p>
+
 <h2>5. Limits</h2>
 <p>This is a simulation on one public feeder with synthetic customer variation. Each episode holds a single event that lasts to the end of the day; real faults overlap and persist for weeks. The fault/attack rule uses only the direction of the change, so downward attacks are labelled as faults. Slow drift is hard for every method here. The test set is small, and the classifier has learned the habits of this simulator, so its numbers should not be read as field performance.</p>
 
