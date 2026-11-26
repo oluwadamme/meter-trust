@@ -65,7 +65,7 @@ All three first mark a reading that did not arrive on time as **communication lo
    - It does not add up and the meter reads low: **meter fault**.
    - It does not add up and the meter reads high: **attack**.
 
-The peer and balance checks learn only from 21 days of normal history. No labels are used.
+The peer and balance checks learn only from 15 days of normal history (days 0-14), so the days used to set the classifier's alarm threshold and the test days are new to them. No labels are used.
 
 ## The classifier
 

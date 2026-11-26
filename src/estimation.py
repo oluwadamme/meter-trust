@@ -119,15 +119,21 @@ def residual_tests(net: pp.pandapowerNet, defs: pd.DataFrame, values: pd.Series,
         se = StateEstimation(net, algorithm="wls")
         se.estimate(zero_injection=zero_injection_buses(net))
         s = se.solver
-        idx = np.asarray(s.pp_meas_indices).ravel()
-        r = np.asarray(s.r).ravel()
-        r_inv = np.diag(s.R_inv)
-        h_g_ht = np.einsum("ij,ji->i", s.H, np.linalg.solve(s.Gm, s.H.T))
-    except Exception:  # unobservable or singular: no test possible at this step
-        return {"ok": False, "J": np.nan, "dof": np.nan, "threshold": np.nan,
-                "flag": False, "rn": pd.Series(dtype=float)}
+        if s.successful:
+            idx = np.asarray(s.pp_meas_indices).ravel()
+            r = np.asarray(s.r).ravel()
+            r_inv = np.diag(s.R_inv)
+            h_g_ht = np.einsum("ij,ji->i", s.H, np.linalg.solve(s.Gm, s.H.T))
+    # Only the expected failures: pandapower raises UserWarning when the grid is
+    # unobservable, and the gain matrix can be singular. Anything else is a bug and must
+    # surface, not turn silently into "no alarm".
+    except (UserWarning, np.linalg.LinAlgError):
+        s = None
     finally:
         _ppc.ZERO_INJECTION_STD_DEV = old
+    if s is None or not s.successful:  # no test possible at this step
+        return {"ok": False, "J": np.nan, "dof": np.nan, "threshold": np.nan,
+                "flag": False, "rn": pd.Series(dtype=float)}
     real = idx >= 0
     omega = np.abs(1 / r_inv[real] - h_g_ht[real])
     rn = pd.Series(np.abs(r[real]) / np.sqrt(np.maximum(omega, 1e-30)), index=idx[real])

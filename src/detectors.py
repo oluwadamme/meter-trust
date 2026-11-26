@@ -11,17 +11,23 @@ reading did not arrive fresh is `comm_loss`. They differ in what they do with th
 3. balance  Peer check plus the energy balance at the trusted transformer meter.
             Deviation and balance holds -> `load_change` (the grid confirms it).
             Deviation and balance broken -> `meter_fault` if the meter reads low,
-            `attack` if it reads high (meters rarely over-read; attackers can go either
-            way, so downward attacks land in `meter_fault`).
+            `attack` if it reads high. "Low" means a smaller magnitude than the peers
+            predict, so a PV customer under-reporting its export counts as low too
+            (meters rarely over-read; attackers can go either way, so attacks that
+            shrink the reading land in `meter_fault`).
 
-The peer and balance models are fitted on 21 days of normal operation (the base
-simulation, days 0-20, with fresh meter noise); none of the episodes or labels are used.
-Thresholds are the 99.5th percentile of the same statistic on that history.
+The peer and balance models are fitted on 15 days of normal operation (the base
+simulation, days 0-14, with fresh meter noise); none of the episodes or labels are used.
+Thresholds are the 99.5th percentile of the same statistic on that history. Days 0-14
+are also the classifier's fit days (train.FIT_DAYS), so its calibration days (15-20)
+and the test days (21-27) are unseen by these models.
 
 Readings that did not arrive fresh are replaced, for the estimator and the balance, by a
 pseudo-measurement: the last fresh value with a wide std (30 % for P/Q, 2 % for V), as an
 operator would do to keep the grid observable.
 """
+import hashlib
+import logging
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -35,7 +41,7 @@ import measurements as meas
 WINDOW = 8          # steps (2 hours) for the rolling mean of peer and balance scores
 N_PEERS = 5
 QUANTILE = 0.995    # threshold = this quantile of |rolling score| on normal history
-HISTORY_DAYS = 21
+HISTORY_DAYS = 15  # must not reach the classifier's calibration days (train.FIT_DAYS)
 
 
 def __getattr__(name):  # OUT_DIR follows the active run (grid.use_run)
@@ -67,7 +73,7 @@ def operator_view(defs: pd.DataFrame, readings: pd.DataFrame, fresh: pd.DataFram
 
 
 def history(net, defs, seed: int = 99) -> pd.DataFrame:
-    """Noisy readings for the normal history (days 0-20 of the base simulation)."""
+    """Noisy readings for the normal history (days 0-14 of the base simulation)."""
     base = grid.load_results(grid.DATA_DIR / "pf")
     true = meas.true_values(defs, base).iloc[: HISTORY_DAYS * grid.STEPS_PER_DAY]
     return meas.add_noise(true, meas.std_devs(defs, true), seed=seed)
@@ -104,6 +110,18 @@ def _wls_episode(ep: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def input_hashes(data: dict) -> pd.Series:
+    """Per-episode fingerprint of the WLS inputs (readings and freshness).
+
+    Stored with the WLS results so a cached result is reused only for an episode whose
+    inputs have not changed since it was estimated.
+    """
+    rows = pd.DataFrame({"r": pd.util.hash_pandas_object(data["readings"]),
+                         "f": pd.util.hash_pandas_object(data["fresh"])})
+    return rows.groupby(level="episode").apply(
+        lambda g: hashlib.sha1(g.to_numpy().tobytes()).hexdigest()[:16]).rename("input_hash")
+
+
 def run_wls_baseline(data: dict, workers: int = 8) -> pd.DataFrame:
     """Chi-square and normalised residuals for every (episode, step). ~5 min on 8 cores."""
     defs = data["defs"]
@@ -111,7 +129,13 @@ def run_wls_baseline(data: dict, workers: int = 8) -> pd.DataFrame:
     eps = list(data["episodes"].index)
     with ProcessPoolExecutor(workers, initializer=_init_worker, initargs=(grid.RUN, defs, vals, std)) as ex:
         parts = list(ex.map(_wls_episode, eps, chunksize=4))
-    return pd.concat(parts).set_index(["episode", "step"]).sort_index()
+    out = pd.concat(parts).set_index(["episode", "step"]).sort_index()
+    failed = int((~out.ok).sum())
+    if failed:  # a failed step raises no alarm, so say how many there were
+        logging.getLogger(__name__).warning("WLS failed on %d of %d steps (no test there)",
+                                            failed, len(out))
+    out["input_hash"] = input_hashes(data).reindex(out.index.get_level_values("episode")).to_numpy()
+    return out
 
 
 def wls_predictions(data: dict, wls: pd.DataFrame, rn_threshold: float = 3.0) -> pd.DataFrame:
@@ -149,7 +173,8 @@ def fit_peers(hist: pd.DataFrame, defs: pd.DataFrame) -> dict:
 
 
 def peer_scores(data: dict, model: dict):
-    """Rolling peer z-score per meter and step, and whether the peers were all available."""
+    """Rolling peer z-score per meter and step, the alarm flag, whether the peers were all
+    available, and the rolling peer-predicted P (its sign says consumer or exporter)."""
     defs = data["defs"]
     vals, _ = operator_view(defs, data["readings"], data["fresh"])
     pcol = meter_columns(defs)
@@ -157,15 +182,20 @@ def peer_scores(data: dict, model: dict):
     p.columns = pcol.index
     fr = fresh_by_meter(defs, data["fresh"])
     z = pd.DataFrame(index=p.index, columns=p.columns, dtype=float)
+    expected = pd.DataFrame(index=p.index, columns=p.columns, dtype=float)
     covered = pd.DataFrame(True, index=p.index, columns=p.columns)
     for m, mod in model.items():
-        pred = mod["coef"][0] + p[mod["peers"]].to_numpy() @ mod["coef"][1:]
-        z[m] = (p[m] - pred) / mod["sigma"]
+        expected[m] = mod["coef"][0] + p[mod["peers"]].to_numpy() @ mod["coef"][1:]
+        z[m] = (p[m] - expected[m]) / mod["sigma"]
         covered[m] = fr[mod["peers"]].all(axis=1)
     z = z.where(covered)
-    zbar = z.groupby(level="episode").transform(lambda s: s.rolling(WINDOW, min_periods=WINDOW).mean())
+
+    def roll(df):
+        return df.groupby(level="episode").transform(lambda s: s.rolling(WINDOW, min_periods=WINDOW).mean())
+
+    zbar = roll(z)
     thr = pd.Series({m: mod["threshold"] for m, mod in model.items()})
-    return zbar, zbar.abs() > thr, covered
+    return zbar, zbar.abs() > thr, covered, roll(expected)
 
 
 def peer_predictions(data: dict, flag: pd.DataFrame) -> pd.DataFrame:
@@ -205,16 +235,23 @@ def balance_scores(data: dict, model: dict):
     return ebar, ebar.abs() > model["threshold"]
 
 
-def balance_predictions(data: dict, peer_flag, peer_z, bal_flag) -> pd.DataFrame:
+def balance_predictions(data: dict, peer_flag, peer_z, bal_flag, peer_expected) -> pd.DataFrame:
+    """Peer deviation + balance holds -> load_change; + balance broken -> meter_fault if the
+    reading's magnitude is below what the peers predict, attack if above.
+
+    For an exporting PV customer (negative expected P) an under-read pushes P up, so the
+    sign of z is flipped before deciding low or high.
+    """
     labels = data["labels"]
     pred = pd.DataFrame("normal", index=labels.index, columns=labels.columns)
     flag = peer_flag.reindex(columns=pred.columns, fill_value=False)
-    z = peer_z.reindex(columns=pred.columns)
+    direction = np.where(peer_expected.reindex(columns=pred.columns) < 0, -1.0, 1.0)
+    toward_larger = peer_z.reindex(columns=pred.columns) * direction  # > 0: reads high
     broken = pd.DataFrame(np.repeat(bal_flag.to_numpy()[:, None], pred.shape[1], axis=1),
                           index=pred.index, columns=pred.columns)
     pred[flag & ~broken] = "load_change"
-    pred[flag & broken & (z < 0)] = "meter_fault"
-    pred[flag & broken & (z > 0)] = "attack"
+    pred[flag & broken & (toward_larger < 0)] = "meter_fault"
+    pred[flag & broken & (toward_larger > 0)] = "attack"
     pred[~fresh_by_meter(data["defs"], data["fresh"]).reindex(columns=pred.columns, fill_value=True)] = "comm_loss"
     return pred
 
@@ -260,7 +297,7 @@ def run_all(data: dict, net=None, wls: pd.DataFrame | None = None) -> dict:
     defs = data["defs"]
     hist = history(net, defs)
     peer_model, bal_model = fit_peers(hist, defs), fit_balance(hist, defs)
-    peer_z, peer_flag, covered = peer_scores(data, peer_model)
+    peer_z, peer_flag, covered, peer_expected = peer_scores(data, peer_model)
     bal_e, bal_flag = balance_scores(data, bal_model)
     nw_model = fit_balance_noise_aware(hist, defs)
     nw_e, nw_flag = balance_scores_noise_aware(data, nw_model)
@@ -268,11 +305,11 @@ def run_all(data: dict, net=None, wls: pd.DataFrame | None = None) -> dict:
         wls = run_wls_baseline(data)
     return {
         # extra variants, kept out of "pred" so notebooks 03-04 stay as published
-        "pred_extra": {"balance_nw": balance_predictions(data, peer_flag, peer_z, nw_flag)},
+        "pred_extra": {"balance_nw": balance_predictions(data, peer_flag, peer_z, nw_flag, peer_expected)},
         "bal_nw_e": nw_e, "bal_nw_flag": nw_flag, "bal_nw_model": nw_model,
         "pred": {"wls": wls_predictions(data, wls),
                  "peer": peer_predictions(data, peer_flag),
-                 "balance": balance_predictions(data, peer_flag, peer_z, bal_flag)},
+                 "balance": balance_predictions(data, peer_flag, peer_z, bal_flag, peer_expected)},
         "wls": wls, "peer_z": peer_z, "peer_flag": peer_flag, "peer_covered": covered,
         "bal_e": bal_e, "bal_flag": bal_flag, "peer_model": peer_model, "bal_model": bal_model,
     }

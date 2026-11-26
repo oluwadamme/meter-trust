@@ -24,9 +24,18 @@ def run(name: str) -> tuple[dict, dict]:
     data = sc.load()
     wls_file = grid.DATA_DIR / "detectors" / "wls.parquet"
     wls = pd.read_parquet(wls_file) if wls_file.exists() else None
+    # Reuse a cached result only where the episode's inputs are unchanged; results from an
+    # older cache without fingerprints, or for changed or removed episodes, are dropped.
+    current = det.input_hashes(data)
+    if wls is not None and "input_hash" in wls:
+        stored = wls.input_hash.groupby(level="episode").first()
+        valid = stored.index[stored == current.reindex(stored.index)]
+        wls = wls[wls.index.get_level_values("episode").isin(valid)]
+    else:
+        wls = None
     done = set() if wls is None else set(wls.index.get_level_values("episode"))
     todo = [e for e in data["episodes"].index if e not in done]
-    if todo:  # WLS only for episodes not yet estimated (standard episodes never change)
+    if todo:  # WLS only for episodes not yet estimated with these exact inputs
         sub = {k: (v.loc[todo] if k in ("readings", "true", "fresh", "labels", "episodes") else v)
                for k, v in data.items()}
         new = det.run_wls_baseline(sub)
@@ -45,21 +54,22 @@ def summary(data: dict, out: dict) -> pd.Series:
     """Headline numbers for one run, for side-by-side comparison."""
     E, L, wls = data["episodes"], data["labels"], out["wls"]
     E = E[~E.subtype.isin(sc.PV_SUBTYPES)]  # standard episodes only, comparable across runs
+    normal = wls.loc[E.index[E.cls == "normal"]]  # WLS learns nothing, so all days are fair
+    # Detection and false alarms on the test days only, for rules and classifier alike:
+    # earlier days were used to fit the rules' models or the classifier.
+    E = E[E.split == "test"]
     L = L.loc[E.index]
-    normal = wls.loc[E.index[E.cls == "normal"]]
-    test = E.index[E.split == "test"]
     s = {
         "WLS: mean J on normal episodes (dof 5)": normal.J.mean(),
         "WLS: chi-square alarm rate on normal": normal.flag.mean(),
         "Energy balance: residual std (kW)": out["bal_model"]["sigma"] * 1e3,
     }
     for name, key in [("Peer + balance", "balance"), ("Classifier", "ml")]:
-        d = ev.detection(E.loc[test] if key == "ml" else E, out["pred"][key])
+        d = ev.detection(E, out["pred"][key])
         for cls in ["load_change", "meter_fault", "attack"]:
             s[f"{name}: {cls} events detected"] = d[d.cls == cls].detected.mean()
         s[f"{name}: consistent attacks detected"] = d[d.subtype == "consistent"].detected.mean()
-        rows = test if key == "ml" else E.index
-        s[f"{name}: false alarms"] = ev.false_alarm_rate(L.loc[rows], out["pred"][key].loc[rows])
+        s[f"{name}: false alarms"] = ev.false_alarm_rate(L, out["pred"][key].loc[E.index])
     return pd.Series(s)
 
 

@@ -90,7 +90,7 @@ FEATURES = ["p_kw", "change_vs_2h", "flatness_2h", "angle_dev_deg", "peer_z", "p
 
 
 FALSE_ALARM_BUDGET = 0.006
-FIT_DAYS = 15
+FIT_DAYS = det.HISTORY_DAYS  # the rule detectors learn from these days too, never beyond
 
 
 def _part(feat: pd.DataFrame, episodes: pd.DataFrame) -> pd.Series:
