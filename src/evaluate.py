@@ -155,3 +155,30 @@ def plot_peer_coverage(cov: pd.DataFrame, path=None):
     fig.tight_layout()
     if path: fig.savefig(path, dpi=150, bbox_inches="tight")
     return fig
+
+
+def chance_detection(episodes: pd.DataFrame, pred: pd.DataFrame, start: int = 48, seed: int = 0) -> pd.Series:
+    """How often would `detection` score a hit by luck?
+
+    For every normal episode, pick a random customer meter and pretend an event starts at
+    `start`; report the share of those where the detector still gives each class at least
+    once afterwards. A detection rate is only meaningful well above this level.
+    """
+    rng = np.random.default_rng(seed)
+    meters = [m for m in pred.columns if m != "TRAFO"]
+    hits = {c: [] for c in CLASSES if c != "normal"}
+    for ep in episodes.index[episodes.cls == "normal"]:
+        after = pred.loc[ep].loc[start:, rng.choice(meters)]
+        for c in hits:
+            hits[c].append((after == c).any())
+    return pd.Series({c: np.mean(v) for c, v in hits.items()})
+
+
+def plot_importance(imp: pd.Series, path=None):
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    imp.sort_values().plot.barh(ax=ax, color="tab:purple")
+    ax.set_xlabel("drop in macro-F1 when the feature is shuffled")
+    ax.set_title("What the classifier relies on")
+    fig.tight_layout()
+    if path: fig.savefig(path, dpi=150, bbox_inches="tight")
+    return fig

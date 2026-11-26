@@ -9,7 +9,9 @@ When a smart meter suddenly shows less energy, four very different things could 
 - the data stopped arriving or is old (a **communication loss**),
 - someone changed the numbers on purpose (a **false-data attack**).
 
-On a utility dashboard these can look exactly the same. This project builds all four, plus normal operation, in a simulated distribution grid and tests how well three common checks can tell them apart.
+On a utility dashboard these can look exactly the same. This project builds all four, plus normal operation, in a simulated distribution grid and tests how well three common checks, and a machine-learning classifier that combines them, can tell them apart.
+
+A two-page summary is in [`report/meter_trust.pdf`](report/meter_trust.pdf).
 
 > This is a simulation on a public test grid (SimBench), not real utility data.
 
@@ -38,6 +40,7 @@ This project rebuilds both situations and adds a third: an attacker who edits re
 5. **State estimation.** Weighted least squares (WLS) estimates the grid state from the readings. With clean readings it matches the power flow within the meter noise (notebook 01).
 6. **Scenarios.** 300 one-day episodes, 60 per class. Each episode has at most one event, which starts partway through the day.
 7. **Detectors.** Three rule-based checks label every meter at every step (below).
+8. **Classifier.** A gradient-boosted model learns to combine the same signals, trained on earlier days and tested on later ones.
 
 ## The five situations
 
@@ -63,6 +66,13 @@ All three first mark a reading that did not arrive on time as **communication lo
    - It does not add up and the meter reads high: **attack**.
 
 The peer and balance checks learn only from 21 days of normal history. No labels are used.
+
+## The classifier
+
+A gradient-boosted tree model (scikit-learn `HistGradientBoostingClassifier`) looks at each meter at each step and picks one of the five classes. It sees only what an operator would have: the readings, whether they arrived on time, the transformer meter, and the scores from the three checks above.
+
+- **Split by time.** It learns from days 0-14, its alarm threshold is set on days 15-20, and it is tested on days 21-27. A random split would leak, because neighbouring steps look almost the same.
+- **Same false-alarm budget as the rules.** Left alone, it flagged about 17 % of normal readings. It now raises an alarm only when it is confident enough to keep false alarms near 1 %, the same level as the rule-based checks.
 
 ## Results
 
@@ -94,13 +104,32 @@ Confusion matrices, detection delays and test-week numbers are in `notebooks/03_
 - **If the attacker could also change the transformer reading, nothing here could catch them.** The faked readings would then match a real load change everywhere.
 - **A gateway outage also hurts the meters that are still working.** When one gateway fails, about a quarter of the healthy meters lose at least one of their peers. In the worst case more than half do.
 
+### Rules vs classifier on the test weeks
+
+Days 21-27 only, at about the same false-alarm level (0.8 % and 1.0 % of normal readings). Share of events where the right class was given at least once:
+
+| Situation (test events) | 3. Peer + balance | 4. Classifier |
+|---|---|---|
+| Attack: consistent (7) | 43 % | **71 %** |
+| Attack: naive (7) | 57 % | 57 % |
+| Real load change: down (6) / up (8) | 33 % / 100 % | 100 % / 88 % |
+| Meter fault: stuck (5) | 20 % | **100 %** |
+| Meter fault: gain (5) | 60 % | 60 % |
+| Meter fault: slow drift (5) | 0 % | 40 % |
+
+- **The classifier is better, but by less than these numbers suggest.** It hands out "load change" so freely that it would hit a random meter in about a quarter of normal episodes just by chance. For attacks the chance level is 7 %, so its 71 % there is a real gain.
+- **It mostly relies on four things:** whether the reading arrived on time, how far the meter drifted from its peers, whether the reading went flat, and whether the transformer total still adds up. The state-estimation residuals add almost nothing, which matches the finding above.
+
+![Feature importance](figures/feature_importance.png)
+
 ## Honest limits
 
 - It is a simulation on one public feeder, with synthetic customer variation. Real data would be messier.
 - Each episode has one event lasting to the end of the day. Real faults overlap, come and go, and last weeks.
 - The rule that separates attacks from faults uses only the direction of the change. Downward attacks look like undercounting meters and are labelled as faults.
 - Slow drift is hard for every detector here.
-- The numbers are small: 20-30 events per type, and 7 per attack type in the test weeks.
+- The numbers are small: 20-30 events per type, and only 5-8 per type in the test weeks. One event moves a test score by 12-20 points.
+- The classifier has learned the habits of this simulator (one event per day, a fixed list of fault types). It would need real data before anyone should trust it.
 - An earlier plan expected the residual test to be completely blind to the consistent attack. It is not, because the transformer meter is part of the estimate. The results above are the corrected version.
 
 ## How to run
@@ -113,9 +142,10 @@ python3.11 -m venv .venv
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/01_explore_grid.ipynb
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/02_scenarios.ipynb
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/03_results.ipynb
+.venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/04_classifier.ipynb
 ```
 
-Notebook 03 takes about 8 minutes, mostly for the state estimation on all 28,800 steps (run in parallel). The `data/` folder is created by the notebooks and is not stored in git.
+Notebook 03 takes about 8 minutes (notebook 04 reuses its results), mostly for the state estimation on all 28,800 steps (run in parallel). The `data/` folder is created by the notebooks and is not stored in git.
 
 ## What is in the repo
 
@@ -126,12 +156,15 @@ src/
   estimation.py     WLS state estimation, chi-square and residual tests
   scenarios.py      the 5 situations, labelled dataset
   detectors.py      the 3 detectors
+  train.py          features and the gradient-boosted classifier
   evaluate.py       confusion matrices, detection delay, figures
 notebooks/
   01_explore_grid.ipynb   grid, load profiles, WLS vs power flow
   02_scenarios.ipynb      dataset and one example per situation
-  03_results.ipynb        detector results
+  03_results.ipynb        rule-based detector results
+  04_classifier.ipynb     classifier vs rules on the test weeks
 figures/                  plots used above
+report/                   two-page write-up (HTML source and PDF)
 ```
 
 ## Tools
@@ -140,6 +173,9 @@ Python, [pandapower](https://www.pandapower.org/) 3.5.6, [SimBench](https://simb
 
 A note for pandapower users: in version 3.5.6 a few state-estimation helpers (`zero_injection="no_inj_bus"`, `chi2_analysis`, `remove_bad_data`) do not work on this feeder. `src/estimation.py` explains each problem and the workaround.
 
-## Next
+## Possible next steps
 
-A machine-learning classifier (gradient-boosted trees) trained on the first three weeks and tested on the fourth, to see whether combining all these signals separates the classes better than the rules do.
+- An attacker who can also change the transformer reading: shows exactly where these methods stop working.
+- A medium-voltage feeder with rooftop solar, where power can flow backwards.
+- A forecast-aided (Kalman filter) state estimator, which uses the time history that plain WLS ignores.
+- Real smart-meter data for the customer profiles.

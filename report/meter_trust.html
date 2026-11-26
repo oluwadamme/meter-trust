@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Can the operator trust this meter reading?</title>
+<style>
+  @page { size: A4; margin: 13mm 15mm 12mm 15mm; }
+  body { font-family: "Charter", "Georgia", serif; font-size: 9.4pt; line-height: 1.32; color: #111; margin: 0; }
+  h1 { font-size: 15pt; margin: 0 0 2pt 0; line-height: 1.2; }
+  .sub { font-size: 10pt; color: #333; margin-bottom: 2pt; }
+  .meta { font-size: 8.6pt; color: #555; margin-bottom: 8pt; border-bottom: 0.6pt solid #999; padding-bottom: 5pt; }
+  h2 { font-size: 10.6pt; margin: 9pt 0 3pt 0; }
+  p { margin: 0 0 5pt 0; text-align: justify; hyphens: auto; }
+  ul { margin: 0 0 5pt 0; padding-left: 14pt; }
+  li { margin-bottom: 2.5pt; text-align: justify; }
+  table { border-collapse: collapse; width: 100%; font-size: 8.6pt; margin: 3pt 0 4pt 0; }
+  th, td { border-bottom: 0.5pt solid #bbb; padding: 2pt 4pt; text-align: left; vertical-align: top; }
+  th { border-bottom: 0.9pt solid #555; font-weight: 600; }
+  td.n, th.n { text-align: right; white-space: nowrap; }
+  figure { margin: 4pt 0 5pt 0; text-align: center; break-inside: avoid; }
+  figure img { width: 58%; }
+  figcaption { font-size: 8.4pt; color: #333; text-align: left; margin-top: 2pt; }
+  .cap { font-size: 8.4pt; color: #333; margin-bottom: 6pt; }
+  .page2 { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<h1>Can the operator trust this meter reading?</h1>
+<div class="sub">Telling meter faults, communication loss, false data and real load change apart on a low-voltage feeder</div>
+<div class="meta">Damilola Adeniyi &middot; November 2026 &middot; Code and notebooks: github.com/oluwadamme/meter-trust &middot; Simulation study on a public test grid, not utility data.</div>
+
+<h2>1. The question</h2>
+<p>For four years I worked on smart-metering systems in Nigeria. Two situations kept coming back. A meter that undercounted and a customer whose usage really dropped looked the same on the dashboard, and comparing the meter with its neighbours flagged both as faulty. When a building's data concentrator (gateway) failed, every meter behind it went silent at once, and the neighbour comparison stopped working because the neighbours were silent too. This project rebuilds both situations in simulation, adds a third (an attacker who edits readings so that they still look physically correct), and asks: how well do the standard checks separate these cases, where do they fail, and does combining them help?</p>
+
+<h2>2. Setup</h2>
+<p><b>Grid and load.</b> SimBench feeder <i>1-LV-semiurb4</i>: one 0.4&#8239;MVA transformer, 44 buses, 41 customers, one PV unit, three cables, each treated as one gateway. Four weeks of 15-minute profiles (2,688 steps) drive an AC power flow in pandapower. SimBench reuses 10 load shapes for 41 customers, so each customer gets its own smooth random variation (about 30&#8239;%). Without it, neighbours would be scaled copies of each other and the peer check would look far better than it can be.</p>
+<p><b>Meters.</b> Transformer P, Q and voltage (0.5&#8239;% noise, assumed trusted); P and Q at every customer (1.5&#8239;%); voltage at the last customer of each cable (0.5&#8239;%). Weighted least squares (WLS) state estimation on clean readings reproduces the power flow, and the chi-square statistic follows its theoretical distribution (mean 4.96 for 5 degrees of freedom).</p>
+<p><b>Five classes.</b> 300 one-day episodes (60 per class), each with at most one event starting partway through the day:</p>
+<table>
+<tr><th>Class</th><th>Simulation</th></tr>
+<tr><td>Normal</td><td>True values plus noise.</td></tr>
+<tr><td>Real load change</td><td>One customer's demand &times;1.5&ndash;3 or &times;0.2&ndash;0.6; power flow re-run, so all readings stay consistent.</td></tr>
+<tr><td>Meter fault</td><td>Only the reported value changes: gain 0.5&ndash;0.8, stuck, or slow drift.</td></tr>
+<tr><td>Communication loss</td><td>One meter missing or stale, or a whole gateway silent.</td></tr>
+<tr><td>False-data attack</td><td><i>Naive:</i> random offset. <i>Consistent:</i> the attacker scales a load in a copy of the grid, runs a power flow, and writes the result into the target meter and the nearby voltage meter. The attacker knows the grid model but cannot touch the transformer meter.</td></tr>
+</table>
+
+<h2>3. Detectors</h2>
+<p>All detectors first mark a reading that did not arrive on time as communication loss, as any metering head-end would.
+(1) <b>WLS</b> with the chi-square test and the largest normalised residual (LNR), which blames one reading as bad data.
+(2) <b>Peer check</b>: each customer is predicted from the five customers it historically tracks; a sustained deviation is called a meter fault.
+(3) <b>Peer check + energy balance</b>: a deviating meter is a real load change if the transformer total still adds up; otherwise a meter fault if it reads low, an attack if it reads high.
+(4) <b>Classifier</b>: gradient-boosted trees on per-meter features built from the same signals, fitted on days 0&ndash;14, alarm threshold set on days 15&ndash;20 to match the rules' false-alarm level (about 1&#8239;% of normal readings), tested on days 21&ndash;27. Rules (2) and (3) use only normal history; no detector is tuned on the test days.</p>
+
+<h2>4. Results</h2>
+<figure>
+<img src="../figures/attack_size.png" alt="Alarm rate against the size of the faked change">
+<figcaption><b>Figure 1.</b> Consistent attacks: share of attack steps flagged by the chi-square test and by the energy balance, against the size of the faked change at the target meter. Dotted lines: the same alarms on real load changes.</figcaption>
+</figure>
+
+<table>
+<tr><th>Test events, days 21&ndash;27 (number)</th><th class="n">1. WLS</th><th class="n">2. Peer</th><th class="n">3. Peer + balance</th><th class="n">4. Classifier</th></tr>
+<tr><td>Attack, consistent (7)</td><td class="n">0&#8239;%</td><td class="n">0&#8239;%</td><td class="n">43&#8239;%</td><td class="n">71&#8239;%</td></tr>
+<tr><td>Attack, naive (7)</td><td class="n">0&#8239;%</td><td class="n">0&#8239;%</td><td class="n">57&#8239;%</td><td class="n">57&#8239;%</td></tr>
+<tr><td>Real load change, down / up (6 / 8)</td><td class="n">0 / 0&#8239;%</td><td class="n">0 / 0&#8239;%</td><td class="n">33 / 100&#8239;%</td><td class="n">100 / 88&#8239;%</td></tr>
+<tr><td>Meter fault, stuck / gain / drift (5 each)</td><td class="n">0 / 20 / 0&#8239;%</td><td class="n">60 / 60 / 0&#8239;%</td><td class="n">20 / 60 / 0&#8239;%</td><td class="n">100 / 60 / 40&#8239;%</td></tr>
+<tr><td>Communication loss, all kinds (15)</td><td class="n">100&#8239;%</td><td class="n">100&#8239;%</td><td class="n">100&#8239;%</td><td class="n">100&#8239;%</td></tr>
+<tr><td>False alarms (normal meter-steps)</td><td class="n">0.1&#8239;%</td><td class="n">0.8&#8239;%</td><td class="n">0.8&#8239;%</td><td class="n">1.0&#8239;%</td></tr>
+</table>
+<div class="cap"><b>Table 1.</b> Share of test events in which an affected meter was ever given the correct class. With 5&ndash;8 events per row, one event moves a value by 12&ndash;20 points.</div>
+
+<ul>
+<li><b>The residual test detects but cannot locate.</b> The transformer is the only measurement that cross-checks the customers, so all customer readings form one critical set with equal normalised residuals. The chi-square test raises alarms, but LNR picks the bad meter essentially at random.</li>
+<li><b>The peer check reproduces the field problem.</b> It flags most real load changes as meter faults, exactly the confusion seen in practice.</li>
+<li><b>The energy balance at the transformer resolves much of it.</b> Asking whether the total still adds up turns most of those false fault calls into correct load-change answers.</li>
+<li><b>The consistent attack is visible only through the transformer meter.</b> I expected the residual test to be blind to it. It is not, because the transformer meter is part of the estimate. Both the residual test and the energy balance miss faked changes below about 0.25&#8239;kW and catch almost all above 2&#8239;kW. In between, the balance (averaged over two hours) is more sensitive and raises fewer alarms on real load changes (Figure 1). If the attacker could also edit the transformer reading, the readings would match a real load change everywhere, and no test on these measurements could separate them.</li>
+<li><b>Gateway outages hurt healthy meters too.</b> When one gateway fails, about a quarter of the meters that still report lose at least one of their five peers, and in the worst case more than half do.</li>
+<li><b>Combining the signals helps, modestly.</b> At the same false-alarm level the classifier names 5 of 7 consistent attacks (chance level 7&#8239;%) and every stuck meter. Its load-change score is weaker evidence: it assigns that class so freely that it would hit a random meter in about a quarter of normal episodes. It relies on four signals: whether the reading arrived on time, the peer deviation, whether the reading went flat, and the energy balance. The WLS residuals add almost nothing.</li>
+</ul>
+
+<h2>5. Limits</h2>
+<p>This is a simulation on one public feeder with synthetic customer variation. Each episode holds a single event that lasts to the end of the day; real faults overlap and persist for weeks. The fault/attack rule uses only the direction of the change, so downward attacks are labelled as faults. Slow drift is hard for every method here. The test set is small, and the classifier has learned the habits of this simulator, so its numbers should not be read as field performance.</p>
+
+<h2>6. What I take from it</h2>
+<p>On a feeder metered mainly at the customers, a lot depends on one measurement: the transformer reading is the only physical cross-check. Making estimation robust to wrong data is therefore partly a question of where to add redundant measurements, and how to use time history, which static WLS ignores. Those are the questions I would like to study next: forecast-aided state estimation, measurement placement for bad-data identification, and real smart-meter data on feeders with rooftop solar.</p>
+
+</body>
+</html>
