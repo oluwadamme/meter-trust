@@ -59,6 +59,10 @@ def define_measurements(net: pp.pandapowerNet) -> pd.DataFrame:
 
     defs = pd.DataFrame(rows)
     defs.index.name = "meas_id"
+    # Physical meter each reading comes from: the transformer meter, or the smart meter
+    # at a customer bus (which also reports voltage where one is listed above).
+    defs["meter"] = ["TRAFO" if gw == "TRAFO" else f"C{b}"
+                     for gw, b in zip(defs.gateway, defs.element)]
     return defs
 
 
