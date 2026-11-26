@@ -8,6 +8,7 @@ import copy
 from pathlib import Path
 
 import networkx as nx
+import numpy as np
 import pandas as pd
 import pandapower as pp
 import pandapower.topology as top
@@ -46,10 +47,17 @@ def assign_gateways(net: pp.pandapowerNet) -> pd.Series:
     return pd.Series(bus_to_gw, name="gateway")
 
 
-def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0) -> dict:
+def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0,
+                 variation: float = 0.3, seed: int = 0) -> dict:
     """Absolute load/PV profiles (MW, Mvar) for `n_days` days, re-indexed from 0.
 
     Keys are (element, column), e.g. ("load", "p_mw"), as returned by SimBench.
+
+    SimBench gives this feeder only 10 distinct load profiles for 41 customers, so most
+    customers are exact scaled copies of another one. Real neighbours are never that
+    alike, and a peer check would look far better than it is. Each customer's P and Q
+    are therefore multiplied by its own smooth random factor (log-normal AR(1), std
+    `variation`, about 1 hour memory). Set variation=0 for the raw SimBench profiles.
     """
     profiles = sb.get_absolute_values(net, profiles_instead_of_study_cases=True)
     start, stop = start_day * STEPS_PER_DAY, (start_day + n_days) * STEPS_PER_DAY
@@ -57,7 +65,24 @@ def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0) ->
     for key, df in profiles.items():
         part = df.iloc[start:stop].reset_index(drop=True)
         out[key] = part
+    if variation > 0:
+        factor = _customer_variation(len(out[("load", "p_mw")]), out[("load", "p_mw")].columns,
+                                     variation, seed)
+        for col in ("p_mw", "q_mvar"):
+            out[("load", col)] = out[("load", col)] * factor
     return out
+
+
+def _customer_variation(n_steps: int, loads, sigma: float, seed: int) -> pd.DataFrame:
+    """Mean-one log-normal AR(1) factors, one column per load."""
+    rng = np.random.default_rng(seed)
+    phi = np.exp(-1 / 4)  # correlation time of 4 steps = 1 hour
+    x = np.zeros((n_steps, len(loads)))
+    x[0] = rng.standard_normal(len(loads))
+    eps = rng.standard_normal((n_steps, len(loads))) * np.sqrt(1 - phi ** 2)
+    for t in range(1, n_steps):
+        x[t] = phi * x[t - 1] + eps[t]
+    return pd.DataFrame(np.exp(sigma * x - sigma ** 2 / 2), columns=loads)
 
 
 def run_power_flow_series(net: pp.pandapowerNet, profiles: dict) -> dict:

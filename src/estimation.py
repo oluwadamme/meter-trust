@@ -89,3 +89,49 @@ def chi2_test(net: pp.pandapowerNet, prob_false: float = 0.05) -> dict:
     dof = degrees_of_freedom(net)
     threshold = float(chi2.ppf(1 - prob_false, dof))
     return {"J": j, "dof": dof, "threshold": threshold, "flag": j > threshold}
+
+
+# --- Residual tests with access to the WLS matrices (Week 3) -----------------------
+# The LNR test needs the measurement Jacobian H and gain matrix G, which pandapower's
+# StateEstimation keeps on its solver for plain "wls" (not for the zero-constraint
+# variant). Plain "wls" models zero-injection buses as pseudo-measurements with a
+# module-level std of 1 kW; it is set to 1 W here for the duration of the call, which
+# makes them act as exact constraints (mean J on clean data then sits near the 5
+# degrees of freedom instead of about 3).
+import pandapower.estimation.ppc_conversion as _ppc  # noqa: E402
+from pandapower.estimation.state_estimation import StateEstimation  # noqa: E402
+
+ZERO_INJECTION_STD = 1e-6  # MW
+
+
+def residual_tests(net: pp.pandapowerNet, defs: pd.DataFrame, values: pd.Series,
+                   std: pd.Series, prob_false: float = 0.05) -> dict:
+    """WLS, then the chi-square test and normalised residuals for every measurement.
+
+    Returns ok, J, dof, threshold, flag (chi-square), and rn: a Series of normalised
+    residuals |r_i| / sqrt(Omega_ii) indexed by measurement id. The largest-normalised-
+    residual (LNR) test points at rn.idxmax() when rn.max() > 3.
+    """
+    write_to_net(net, defs, values, std)
+    old = _ppc.ZERO_INJECTION_STD_DEV
+    _ppc.ZERO_INJECTION_STD_DEV = ZERO_INJECTION_STD
+    try:
+        se = StateEstimation(net, algorithm="wls")
+        se.estimate(zero_injection=zero_injection_buses(net))
+        s = se.solver
+        idx = np.asarray(s.pp_meas_indices).ravel()
+        r = np.asarray(s.r).ravel()
+        r_inv = np.diag(s.R_inv)
+        h_g_ht = np.einsum("ij,ji->i", s.H, np.linalg.solve(s.Gm, s.H.T))
+    except Exception:  # unobservable or singular: no test possible at this step
+        return {"ok": False, "J": np.nan, "dof": np.nan, "threshold": np.nan,
+                "flag": False, "rn": pd.Series(dtype=float)}
+    finally:
+        _ppc.ZERO_INJECTION_STD_DEV = old
+    real = idx >= 0
+    omega = np.abs(1 / r_inv[real] - h_g_ht[real])
+    rn = pd.Series(np.abs(r[real]) / np.sqrt(np.maximum(omega, 1e-30)), index=idx[real])
+    j = float((r[real] ** 2 * r_inv[real]).sum())
+    dof = degrees_of_freedom(net)
+    threshold = float(chi2.ppf(1 - prob_false, dof))
+    return {"ok": True, "J": j, "dof": dof, "threshold": threshold, "flag": j > threshold, "rn": rn}
