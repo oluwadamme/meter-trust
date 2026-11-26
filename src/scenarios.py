@@ -54,7 +54,12 @@ SUBTYPES = {
     "attack": ["naive", "consistent"],
 }
 TRAIN_DAYS = 21  # days 0-20 train, 21-27 test: split by time, never at random
-OUT_DIR = grid.DATA_DIR / "scenarios"
+
+
+def __getattr__(name):  # OUT_DIR follows the active run (grid.use_run)
+    if name == "OUT_DIR":
+        return grid.DATA_DIR / "scenarios"
+    raise AttributeError(name)
 
 
 @dataclass
@@ -219,13 +224,15 @@ def generate(net=None, n_per_class: int = 60, n_steps: int = 96, seed: int = 0) 
     return data
 
 
-def save(data: dict, folder: Path = OUT_DIR) -> None:
+def save(data: dict, folder: Path | None = None) -> None:
+    folder = folder or grid.DATA_DIR / "scenarios"
     folder.mkdir(parents=True, exist_ok=True)
     for name, df in data.items():
         df.rename(columns=str).to_parquet(folder / f"{name}.parquet")
 
 
-def load(folder: Path = OUT_DIR) -> dict:
+def load(folder: Path | None = None) -> dict:
+    folder = folder or grid.DATA_DIR / "scenarios"
     data = {}
     for f in sorted(folder.glob("*.parquet")):
         df = pd.read_parquet(f)

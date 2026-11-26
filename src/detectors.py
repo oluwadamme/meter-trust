@@ -36,7 +36,12 @@ WINDOW = 8          # steps (2 hours) for the rolling mean of peer and balance s
 N_PEERS = 5
 QUANTILE = 0.995    # threshold = this quantile of |rolling score| on normal history
 HISTORY_DAYS = 21
-OUT_DIR = grid.DATA_DIR / "detectors"
+
+
+def __getattr__(name):  # OUT_DIR follows the active run (grid.use_run)
+    if name == "OUT_DIR":
+        return grid.DATA_DIR / "detectors"
+    raise AttributeError(name)
 
 
 # --- shared helpers -------------------------------------------------------------------
@@ -77,13 +82,14 @@ def _rolling_threshold(score: pd.DataFrame | pd.Series):
 _W = {}
 
 
-def _init_worker(defs, vals, std):
+def _init_worker(run, defs, vals, std):
     # Worker processes start fresh: silence pandapower's pandas warnings here too,
     # or they flood the notebook output.
     import logging
     import warnings
     warnings.filterwarnings("ignore")
     logging.getLogger("pandapower").setLevel(logging.ERROR)
+    grid.use_run(run)
     _W.update(net=grid.load_net(), defs=defs, vals=vals, std=std)
 
 
@@ -103,7 +109,7 @@ def run_wls_baseline(data: dict, workers: int = 8) -> pd.DataFrame:
     defs = data["defs"]
     vals, std = operator_view(defs, data["readings"], data["fresh"])
     eps = list(data["episodes"].index)
-    with ProcessPoolExecutor(workers, initializer=_init_worker, initargs=(defs, vals, std)) as ex:
+    with ProcessPoolExecutor(workers, initializer=_init_worker, initargs=(grid.RUN, defs, vals, std)) as ex:
         parts = list(ex.map(_wls_episode, eps, chunksize=4))
     return pd.concat(parts).set_index(["episode", "step"]).sort_index()
 
@@ -240,7 +246,8 @@ if __name__ == "__main__":
     t = time.time()
     data = sc.load()
     wls = run_wls_baseline(data)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    wls.to_parquet(OUT_DIR / "wls.parquet")
+    out_dir = grid.DATA_DIR / "detectors"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wls.to_parquet(out_dir / "wls.parquet")
     print(f"WLS baseline: {len(wls)} steps, {int((~wls.ok).sum())} failed, "
           f"chi2 flag rate {wls.flag.mean():.3f}, {time.time() - t:.0f}s")

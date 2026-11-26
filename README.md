@@ -122,6 +122,21 @@ Days 21-27 only, at about the same false-alarm level (0.8 % and 1.0 % of normal 
 
 ![Feature importance](figures/feature_importance.png)
 
+## With rooftop solar (work in progress)
+
+The same study on SimBench's 2034 version of the feeder, in June: 58 customers and 6 rooftop PV systems (172 kWp), so for 13 % of the time power flows backwards through the transformer. Details are in `notebooks/05_rooftop_pv.ipynb`.
+
+![Transformer power, winter vs summer with solar](figures/pv_backflow.png)
+
+First findings:
+
+- **State estimation is not bothered by backflow.** The textbook check behaves exactly as in winter.
+- **The energy balance gets weaker at midday.** Meter error grows with the reading, so big solar outputs make the meters noisier exactly when the sun shines. At the same attack size, the balance catches fewer consistent attacks than in winter (for 1-2 kW fakes: 53 % instead of 87 %). The textbook check does not lose ground, because it weighs every reading by its own accuracy.
+- **Part of the drop is not about solar.** Summer demand is lower, so the simulated events are smaller in kW. Results have to be compared by event size.
+- **Neighbours share the sun.** The peer check predicts solar customers well relative to their size, but their absolute error is larger.
+
+Next: make the energy balance account for the changing meter noise, and add solar-specific cases (a passing cloud, an inverter trip, an attack hidden inside a cloud).
+
 ## Honest limits
 
 - It is a simulation on one public feeder, with synthetic customer variation. Real data would be messier.
@@ -143,6 +158,7 @@ python3.11 -m venv .venv
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/02_scenarios.ipynb
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/03_results.ipynb
 .venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/04_classifier.ipynb
+.venv/bin/jupyter nbconvert --to notebook --execute --inplace notebooks/05_rooftop_pv.ipynb   # ~8 min first time
 ```
 
 Notebook 03 takes about 8 minutes (notebook 04 reuses its results), mostly for the state estimation on all 28,800 steps (run in parallel). The `data/` folder is created by the notebooks and is not stored in git.
@@ -157,12 +173,14 @@ src/
   scenarios.py      the 5 situations, labelled dataset
   detectors.py      the 3 detectors
   train.py          features and the gradient-boosted classifier
+  pipeline.py       run everything for one run (winter or summer_pv)
   evaluate.py       confusion matrices, detection delay, figures
 notebooks/
   01_explore_grid.ipynb   grid, load profiles, WLS vs power flow
   02_scenarios.ipynb      dataset and one example per situation
   03_results.ipynb        rule-based detector results
   04_classifier.ipynb     classifier vs rules on the test weeks
+  05_rooftop_pv.ipynb     the same study on a summer feeder with rooftop solar
 figures/                  plots used above
 report/                   two-page write-up (HTML source and PDF)
 ```

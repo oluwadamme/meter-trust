@@ -1,10 +1,20 @@
 """Load the SimBench LV feeder, its 15-minute profiles, and group customers into gateways.
 
-The feeder is SimBench `1-LV-semiurb4--0-sw`: one 0.4 MVA MV/LV transformer, 44 buses,
-41 loads (households and small businesses) and one small PV unit. It is a public test
-grid, not utility data.
+Two runs share all the code (pick one with `use_run` or the METER_TRUST_RUN variable):
+
+- "winter"     SimBench `1-LV-semiurb4--0-sw`, the first 4 weeks of January. One 0.4 MVA
+               transformer, 44 buses, 41 loads, one small PV unit. Data in data/.
+- "summer_pv"  `1-LV-semiurb4--2-sw`, SimBench's 2034 scenario of the same feeder, 4
+               weeks from 1 June: 58 loads and 6 rooftop PV units (172 kWp against
+               337 kW of load), so power flows back through the transformer at midday.
+               Its 4 home batteries are switched off: they would smooth exactly the
+               signals being tested, and their control is a separate question.
+               Data in data/summer_pv/.
+
+Public test grid, not utility data.
 """
 import copy
+import os
 from pathlib import Path
 
 import networkx as nx
@@ -16,14 +26,32 @@ import simbench as sb
 from pandapower.control import ConstControl
 from pandapower.timeseries import DFData, OutputWriter, run_timeseries
 
-GRID_CODE = "1-LV-semiurb4--0-sw"
 STEPS_PER_DAY = 96  # 15-minute resolution
-DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+ROOT_DATA = Path(__file__).resolve().parents[1] / "data"
+RUNS = {
+    "winter": dict(code="1-LV-semiurb4--0-sw", start_day=0, pv_variation=0.0,
+                   data_dir=ROOT_DATA),
+    "summer_pv": dict(code="1-LV-semiurb4--2-sw", start_day=152, pv_variation=0.1,
+                      data_dir=ROOT_DATA / "summer_pv"),  # day 152 = 1 June 2016
+}
 
 
-def load_net(code: str = GRID_CODE) -> pp.pandapowerNet:
+def use_run(name: str) -> None:
+    """Switch every module to one run's grid, season and data folder."""
+    global RUN, GRID_CODE, START_DAY, PV_VARIATION, DATA_DIR
+    cfg = RUNS[name]
+    RUN, GRID_CODE, START_DAY = name, cfg["code"], cfg["start_day"]
+    PV_VARIATION, DATA_DIR = cfg["pv_variation"], cfg["data_dir"]
+
+
+use_run(os.environ.get("METER_TRUST_RUN", "winter"))
+
+
+def load_net(code: str | None = None) -> pp.pandapowerNet:
     """Return the SimBench net with a `gateway` column added to net.load and net.sgen."""
-    net = sb.get_simbench_net(code)
+    net = sb.get_simbench_net(code or GRID_CODE)
+    if len(net.storage):
+        net.storage["in_service"] = False
     assign_gateways(net)
     return net
 
@@ -47,8 +75,8 @@ def assign_gateways(net: pp.pandapowerNet) -> pd.Series:
     return pd.Series(bus_to_gw, name="gateway")
 
 
-def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0,
-                 variation: float = 0.3, seed: int = 0) -> dict:
+def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int | None = None,
+                 variation: float = 0.3, seed: int = 0, pv_variation: float | None = None) -> dict:
     """Absolute load/PV profiles (MW, Mvar) for `n_days` days, re-indexed from 0.
 
     Keys are (element, column), e.g. ("load", "p_mw"), as returned by SimBench.
@@ -58,7 +86,11 @@ def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0,
     alike, and a peer check would look far better than it is. Each customer's P and Q
     are therefore multiplied by its own smooth random factor (log-normal AR(1), std
     `variation`, about 1 hour memory). Set variation=0 for the raw SimBench profiles.
+    PV units likewise get `pv_variation` (roof direction, shading); SimBench gives all
+    PV units on this feeder the same profile. Defaults come from the active run.
     """
+    start_day = START_DAY if start_day is None else start_day
+    pv_variation = PV_VARIATION if pv_variation is None else pv_variation
     profiles = sb.get_absolute_values(net, profiles_instead_of_study_cases=True)
     start, stop = start_day * STEPS_PER_DAY, (start_day + n_days) * STEPS_PER_DAY
     out = {}
@@ -70,6 +102,9 @@ def get_profiles(net: pp.pandapowerNet, n_days: int = 28, start_day: int = 0,
                                      variation, seed)
         for col in ("p_mw", "q_mvar"):
             out[("load", col)] = out[("load", col)] * factor
+    if pv_variation > 0 and ("sgen", "p_mw") in out:
+        pv = out[("sgen", "p_mw")]
+        out[("sgen", "p_mw")] = pv * _customer_variation(len(pv), pv.columns, pv_variation, seed + 1)
     return out
 
 
@@ -113,14 +148,16 @@ def run_power_flow_series(net: pp.pandapowerNet, profiles: dict) -> dict:
     return {f"{k}": v.copy() for k, v in ow.output.items() if k != "Parameters"}
 
 
-def save_results(results: dict, folder: Path = DATA_DIR / "pf") -> None:
+def save_results(results: dict, folder: Path | None = None) -> None:
+    folder = folder or DATA_DIR / "pf"
     folder.mkdir(parents=True, exist_ok=True)
     for name, df in results.items():
         # parquet needs string column names; rename a copy, not the caller's frame
         df.rename(columns=str).to_parquet(folder / f"{name.replace('.', '__')}.parquet")
 
 
-def load_results(folder: Path = DATA_DIR / "pf") -> dict:
+def load_results(folder: Path | None = None) -> dict:
+    folder = folder or DATA_DIR / "pf"
     out = {}
     for f in sorted(folder.glob("*.parquet")):
         df = pd.read_parquet(f)
